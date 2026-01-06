@@ -150,7 +150,7 @@ class Attention(nn.Module):
         if context.is_prefill:
             if context.block_tables is not None:  # prefix cache
                 pass
-            o = flash_attn_varlen_func(
+            o = varlen_attention_prefill(
                 q,
                 k,
                 v,
