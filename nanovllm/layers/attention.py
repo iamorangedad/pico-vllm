@@ -12,15 +12,15 @@ def store_kvcache(
     v_cache: torch.Tensor,
     slot_mapping: torch.Tensor,
 ):
+    N, num_heads, head_dim = key.shape
+    flat_k_cache = k_cache.view(-1, num_heads, head_dim)
+    flat_v_cache = v_cache.view(-1, num_heads, head_dim)
     valid_mask = slot_mapping != -1
     if not valid_mask.any():
         return
     valid_slots = slot_mapping[valid_mask].long()
-    valid_keys = key[valid_mask]
-    valid_values = value[valid_mask]
-    target_shape = k_cache[valid_slots].shape
-    k_cache[valid_slots] = valid_keys.view(target_shape)
-    v_cache[valid_slots] = valid_values.view(target_shape)
+    flat_k_cache[valid_slots] = key[valid_mask]
+    flat_v_cache[valid_slots] = value[valid_mask]
 
 
 class Attention(nn.Module):
