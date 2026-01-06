@@ -4,53 +4,8 @@ from torch.nn import functional as F
 from torch.utils.cpp_extension import load_inline
 from nanovllm.utils.context import get_context
 
-# Helper Functions
-
-
-def store_kvcache(key, value, k_cache, v_cache, slot_mapping):
-    """Stores tokens into the non-contiguous KV cache blocks."""
-    if key.dim() == 4:
-        key, value = key.flatten(0, 1), value.flatten(0, 1)
-    N, num_heads, head_dim = key.shape
-    flat_k = k_cache.view(-1, num_heads, head_dim)
-    flat_v = v_cache.view(-1, num_heads, head_dim)
-    mask = slot_mapping != -1
-    if mask.any():
-        slots = slot_mapping[mask].long()
-        flat_k[slots] = key[mask]
-        flat_v[slots] = value[mask]
-
-
-def varlen_attention_prefill(q, k, v, cu_q, cu_k, max_q, max_k, scale):
-    """Standard attention for prefill phase with GQA support."""
-    out = torch.empty_like(q)
-
-    # Iterate over packed sequences
-    for i in range(len(cu_q) - 1):
-        q_i = q[cu_q[i] : cu_q[i + 1]].unsqueeze(0).transpose(1, 2)
-        k_i = k[cu_k[i] : cu_k[i + 1]].unsqueeze(0).transpose(1, 2)
-        v_i = v[cu_k[i] : cu_k[i + 1]].unsqueeze(0).transpose(1, 2)
-
-        # GQA: Repeat KV heads if necessary
-        if q_i.shape[1] != k_i.shape[1]:
-            rep = q_i.shape[1] // k_i.shape[1]
-            k_i = k_i.repeat_interleave(rep, dim=1)
-            v_i = v_i.repeat_interleave(rep, dim=1)
-
-        # Causal Masking
-        L, S = q_i.size(-2), k_i.size(-2)
-        attn_mask = torch.ones(L, S, dtype=torch.bool, device=q.device).tril(diagonal=0)
-
-        o_i = F.scaled_dot_product_attention(
-            q_i, k_i, v_i, attn_mask=attn_mask, scale=scale
-        )
-        out[cu_q[i] : cu_q[i + 1]] = o_i.transpose(1, 2).squeeze(0)
-
-    return out
-
-
 # ==========================================
-# 1. CUDA C++ Source Code
+# 1. CUDA C++ Source Code (Fixed)
 # ==========================================
 cuda_source = r"""
 #include <torch/extension.h>
@@ -58,26 +13,22 @@ cuda_source = r"""
 #include <cuda_runtime.h>
 #include <cmath>
 
-#define BLOCK_SIZE_KV 16  // Standard vLLM block size
+#define BLOCK_SIZE_KV 16
 #define WARP_SIZE 32
 
-// Warp-level reduction sum
 __inline__ __device__ float warpReduceSum(float val) {
     for (int offset = WARP_SIZE / 2; offset > 0; offset /= 2)
         val += __shfl_down_sync(0xffffffff, val, offset);
     return val;
 }
 
-// Kernel Function
-// Grid: (batch_size, num_heads)
-// Block: (head_dim) -> Assumes head_dim <= 1024
 __global__ void paged_attention_kernel(
-    const float* __restrict__ Q,            // [batch, num_heads, head_dim]
-    const float* __restrict__ K_Cache,      // [num_blocks, block_size, num_kv_heads, head_dim]
-    const float* __restrict__ V_Cache,      // [num_blocks, block_size, num_kv_heads, head_dim]
-    const int* __restrict__ Block_Tables,   // [batch, max_num_blocks]
-    const int* __restrict__ Context_Lens,   // [batch]
-    float* __restrict__ Out,                // [batch, num_heads, head_dim]
+    const float* __restrict__ Q,
+    const float* __restrict__ K_Cache,
+    const float* __restrict__ V_Cache,
+    const int* __restrict__ Block_Tables,
+    const int* __restrict__ Context_Lens,
+    float* __restrict__ Out,
     const float scale,
     const int num_kv_heads,
     const int head_dim,
@@ -88,21 +39,16 @@ __global__ void paged_attention_kernel(
     const int bt_stride_batch, const int bt_stride_block,
     const int out_stride_batch, const int out_stride_head
 ) {
-    // 1. Identify the Query Head for this thread block
     int batch_idx = blockIdx.x;
     int head_idx = blockIdx.y;
-    int tid = threadIdx.x; // Corresponds to the head_dim dimension
+    int tid = threadIdx.x;
 
-    // GQA: Map Query Head to Key/Value Head
-    // num_heads (gridDim.y) / num_kv_heads
     int num_q_heads = gridDim.y;
     int group_size = num_q_heads / num_kv_heads;
     int kv_head_idx = head_idx / group_size;
 
-    // 2. Load Query into Shared Memory (for reuse across KV blocks)
-    extern __shared__ float s_Q[]; // size: head_dim
+    extern __shared__ float s_Q[];
     
-    // Calculate Q address in HBM
     long long q_offset = (long long)batch_idx * q_stride_batch + (long long)head_idx * q_stride_head + tid;
     float q_val = Q[q_offset];
     
@@ -111,83 +57,62 @@ __global__ void paged_attention_kernel(
     }
     __syncthreads();
 
-    // 3. Initialize Online Softmax Accumulators
-    float m_i = -1e20f;   // max logit
-    float l_i = 0.0f;     // denominator sum
-    float acc_val = 0.0f; // accumulator for Output[tid]
+    float m_i = -1e20f;
+    float l_i = 0.0f;
+    float acc_val = 0.0f;
 
-    // Get current sequence length
     int context_len = Context_Lens[batch_idx];
     int num_blocks = (context_len + BLOCK_SIZE_KV - 1) / BLOCK_SIZE_KV;
 
-    // 4. Iterate over each Block (Direct Read from HBM)
     for (int i = 0; i < num_blocks; ++i) {
-        // Lookup: Get physical block ID from the table
         long long bt_offset = (long long)batch_idx * bt_stride_batch + (long long)i * bt_stride_block;
         int physical_block = Block_Tables[bt_offset];
 
-        // Iterate over tokens within the block (0..15)
         for (int j = 0; j < BLOCK_SIZE_KV; ++j) {
             int current_pos = i * BLOCK_SIZE_KV + j;
-            
-            // Masking check: stop if we exceed context length
             if (current_pos >= context_len) break;
 
-            // --- Compute Q * K ---
-            // Calculate physical address directly (Zero-Copy)
             long long k_offset = (long long)physical_block * k_stride_block + 
                                  (long long)j * k_stride_tok + 
                                  (long long)kv_head_idx * k_stride_head + tid;
             
             float k_val = (tid < head_dim) ? K_Cache[k_offset] : 0.0f;
             
-            // Dot product (Thread-local multiplication)
             float dot = (tid < head_dim) ? (s_Q[tid] * k_val) : 0.0f;
             
-            // Block Reduction for Dot Product
-            // We use Shared Memory reduction to handle any head_dim size (up to 1024)
             __shared__ float s_reduce[1024]; 
             s_reduce[tid] = dot;
             __syncthreads();
             
-            // Tree reduction
             for (int s = blockDim.x / 2; s > 0; s >>= 1) {
                 if (tid < s) {
                     s_reduce[tid] += s_reduce[tid + s];
                 }
                 __syncthreads();
             }
-            float score = s_reduce[0]; // This is now Q * K^T
+            float score = s_reduce[0];
             
             score *= scale;
 
-            // --- Online Softmax Update ---
-            // All threads have the score now.
-            
+            // FIX: Use fmaxf instead of max to avoid ambiguity
             float m_prev = m_i;
-            m_i = max(m_prev, score);
+            m_i = fmaxf(m_prev, score);
             float alpha = expf(m_prev - m_i);
             float p = expf(score - m_i);
 
-            // Update denominator
             l_i = l_i * alpha + p;
 
-            // --- Load V and Accumulate ---
-            // Scale previous accumulator
             acc_val *= alpha;
             
-            // Direct read V from HBM
             long long v_offset = (long long)physical_block * v_stride_block + 
                                  (long long)j * v_stride_tok + 
                                  (long long)kv_head_idx * v_stride_head + tid;
             float v_val = (tid < head_dim) ? V_Cache[v_offset] : 0.0f;
 
-            // Accumulate: acc += p * V
             acc_val += p * v_val;
         }
     }
 
-    // 5. Final Normalization and Write to Output
     acc_val /= l_i;
     
     if (tid < head_dim) {
@@ -197,9 +122,6 @@ __global__ void paged_attention_kernel(
 }
 """
 
-# ==========================================
-# 2. C++ / PyTorch Binding
-# ==========================================
 cpp_source = """
 torch::Tensor paged_attention_cuda(
     torch::Tensor q,
@@ -211,7 +133,7 @@ torch::Tensor paged_attention_cuda(
     
     auto batch_size = q.size(0);
     auto num_heads = q.size(1);
-    auto head_dim = q.size(2); // Input is expected as (Batch, Heads, Dim)
+    auto head_dim = q.size(2);
     
     auto num_kv_heads = k_cache.size(2);
     auto max_num_blocks = block_tables.size(1);
@@ -219,10 +141,9 @@ torch::Tensor paged_attention_cuda(
     auto options = torch::TensorOptions().dtype(q.dtype()).device(q.device());
     auto out = torch::empty({batch_size, num_heads, head_dim}, options);
 
-    // Launch Parameters
     dim3 grid(batch_size, num_heads);
-    dim3 block(head_dim); // One thread per dimension feature
-    int shared_mem_size = head_dim * sizeof(float); // For storing Q
+    dim3 block(head_dim);
+    int shared_mem_size = head_dim * sizeof(float);
 
     paged_attention_kernel<<<grid, block, shared_mem_size>>>(
         q.data_ptr<float>(),
@@ -246,7 +167,7 @@ torch::Tensor paged_attention_cuda(
 }
 """
 
-# JIT Compile the CUDA module
+# Compile with verbose=True to see errors if they happen
 paged_attn_cuda = load_inline(
     name="paged_attention_extension",
     cpp_sources=cpp_source,
@@ -254,12 +175,8 @@ paged_attn_cuda = load_inline(
     functions=["paged_attention_cuda"],
     with_cuda=True,
     extra_cuda_cflags=["-O3"],
-    verbose=False,
+    verbose=True,
 )
-
-# ==========================================
-# 3. Integration with nanovllm
-# ==========================================
 
 
 class Attention(nn.Module):
@@ -275,7 +192,6 @@ class Attention(nn.Module):
         context = get_context()
         k_cache, v_cache = self.k_cache, self.v_cache
 
-        # Flatten inputs for Prefill phase (Batch, Seq, Heads, Dim -> Total_Tokens, Heads, Dim)
         if context.is_prefill:
             if q.dim() == 4:
                 q = q.flatten(0, 1)
@@ -284,13 +200,10 @@ class Attention(nn.Module):
             if v.dim() == 4:
                 v = v.flatten(0, 1)
 
-        # 1. Update KV Cache with new tokens
         if k_cache.numel() and v_cache.numel():
             store_kvcache(k, v, k_cache, v_cache, context.slot_mapping)
 
-        # 2. Compute Attention
         if context.is_prefill:
-            # Prefill Phase: Use standard PyTorch Attention (Parallelized)
             o = varlen_attention_prefill(
                 q,
                 k,
@@ -302,20 +215,12 @@ class Attention(nn.Module):
                 self.scale,
             )
         else:
-            # === Decode Phase: Use Custom CUDA Kernel (Zero-Copy) ===
-
-            # 1. Adjust Shape: Kernel expects (Batch, Heads, Dim)
-            # Input q is usually (Batch, 1, Heads, Dim)
             q_input = q.squeeze(1) if q.dim() == 4 else q
 
-            # 2. Type Check: This simple kernel supports float32
-            # For production on Jetson (FP16), the kernel needs __half support
             original_dtype = q_input.dtype
             if q_input.dtype != torch.float32:
                 q_input = q_input.float()
 
-            # 3. Invoke JIT Compiled Kernel
-            # We ensure cache and tables are in the correct format
             o = paged_attn_cuda.paged_attention_cuda(
                 q_input,
                 k_cache.float(),
@@ -325,7 +230,40 @@ class Attention(nn.Module):
                 self.scale,
             )
 
-            # 4. Restore Shape to (Batch, 1, Heads, Dim)
             o = o.unsqueeze(1).to(original_dtype)
 
         return o
+
+
+def store_kvcache(key, value, k_cache, v_cache, slot_mapping):
+    if key.dim() == 4:
+        key, value = key.flatten(0, 1), value.flatten(0, 1)
+    N, num_heads, head_dim = key.shape
+    flat_k = k_cache.view(-1, num_heads, head_dim)
+    flat_v = v_cache.view(-1, num_heads, head_dim)
+    mask = slot_mapping != -1
+    if mask.any():
+        slots = slot_mapping[mask].long()
+        flat_k[slots] = key[mask]
+        flat_v[slots] = value[mask]
+
+
+def varlen_attention_prefill(q, k, v, cu_q, cu_k, max_q, max_k, scale):
+    out = torch.empty_like(q)
+    for i in range(len(cu_q) - 1):
+        q_i = q[cu_q[i] : cu_q[i + 1]].unsqueeze(0).transpose(1, 2)
+        k_i = k[cu_k[i] : cu_k[i + 1]].unsqueeze(0).transpose(1, 2)
+        v_i = v[cu_k[i] : cu_k[i + 1]].unsqueeze(0).transpose(1, 2)
+
+        if q_i.shape[1] != k_i.shape[1]:
+            rep = q_i.shape[1] // k_i.shape[1]
+            k_i = k_i.repeat_interleave(rep, dim=1)
+            v_i = v_i.repeat_interleave(rep, dim=1)
+
+        L, S = q_i.size(-2), k_i.size(-2)
+        attn_mask = torch.ones(L, S, dtype=torch.bool, device=q.device).tril(diagonal=0)
+        o_i = F.scaled_dot_product_attention(
+            q_i, k_i, v_i, attn_mask=attn_mask, scale=scale
+        )
+        out[cu_q[i] : cu_q[i + 1]] = o_i.transpose(1, 2).squeeze(0)
+    return out
