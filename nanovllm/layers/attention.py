@@ -5,8 +5,9 @@ from torch.utils.cpp_extension import load_inline
 from nanovllm.utils.context import get_context
 
 # ==========================================
-# 1. CUDA C++ Source Code (Fixed)
+# 1. CUDA Source (Contains Kernel AND Wrapper)
 # ==========================================
+# We put everything here so NVCC compiles the <<<>>> syntax.
 cuda_source = r"""
 #include <torch/extension.h>
 #include <cuda.h>
@@ -47,13 +48,13 @@ __global__ void paged_attention_kernel(
     int group_size = num_q_heads / num_kv_heads;
     int kv_head_idx = head_idx / group_size;
 
+    // Load Q into Shared Memory
     extern __shared__ float s_Q[];
-    
     long long q_offset = (long long)batch_idx * q_stride_batch + (long long)head_idx * q_stride_head + tid;
-    float q_val = Q[q_offset];
     
+    // Boundary check for Q
     if (tid < head_dim) {
-        s_Q[tid] = q_val; 
+        s_Q[tid] = Q[q_offset]; 
     }
     __syncthreads();
 
@@ -72,14 +73,15 @@ __global__ void paged_attention_kernel(
             int current_pos = i * BLOCK_SIZE_KV + j;
             if (current_pos >= context_len) break;
 
+            // Zero-Copy Read from HBM
             long long k_offset = (long long)physical_block * k_stride_block + 
                                  (long long)j * k_stride_tok + 
                                  (long long)kv_head_idx * k_stride_head + tid;
             
             float k_val = (tid < head_dim) ? K_Cache[k_offset] : 0.0f;
-            
             float dot = (tid < head_dim) ? (s_Q[tid] * k_val) : 0.0f;
             
+            // Block Reduction
             __shared__ float s_reduce[1024]; 
             s_reduce[tid] = dot;
             __syncthreads();
@@ -91,19 +93,18 @@ __global__ void paged_attention_kernel(
                 __syncthreads();
             }
             float score = s_reduce[0];
-            
             score *= scale;
 
-            // FIX: Use fmaxf instead of max to avoid ambiguity
+            // Online Softmax
             float m_prev = m_i;
-            m_i = fmaxf(m_prev, score);
+            m_i = fmaxf(m_prev, score); // Use fmaxf to avoid ambiguity
             float alpha = expf(m_prev - m_i);
             float p = expf(score - m_i);
 
             l_i = l_i * alpha + p;
-
             acc_val *= alpha;
             
+            // Load V
             long long v_offset = (long long)physical_block * v_stride_block + 
                                  (long long)j * v_stride_tok + 
                                  (long long)kv_head_idx * v_stride_head + tid;
@@ -120,9 +121,8 @@ __global__ void paged_attention_kernel(
         Out[out_offset] = acc_val;
     }
 }
-"""
 
-cpp_source = """
+// Wrapper Function (Compiled by NVCC, so <<<>>> is valid)
 torch::Tensor paged_attention_cuda(
     torch::Tensor q,
     torch::Tensor k_cache,
@@ -167,10 +167,13 @@ torch::Tensor paged_attention_cuda(
 }
 """
 
-# Compile with verbose=True to see errors if they happen
+# ==========================================
+# 2. JIT Compile
+# ==========================================
+# Note: cpp_sources is empty string because everything is in cuda_sources
 paged_attn_cuda = load_inline(
-    name="paged_attention_extension",
-    cpp_sources=cpp_source,
+    name="paged_attention_extension_v2",  # New name to avoid cache collision
+    cpp_sources="",
     cuda_sources=cuda_source,
     functions=["paged_attention_cuda"],
     with_cuda=True,
@@ -179,6 +182,9 @@ paged_attn_cuda = load_inline(
 )
 
 
+# ==========================================
+# 3. Integration
+# ==========================================
 class Attention(nn.Module):
     def __init__(self, num_heads, head_dim, scale, num_kv_heads):
         super().__init__()
@@ -192,6 +198,7 @@ class Attention(nn.Module):
         context = get_context()
         k_cache, v_cache = self.k_cache, self.v_cache
 
+        # Prefill: Flatten Inputs
         if context.is_prefill:
             if q.dim() == 4:
                 q = q.flatten(0, 1)
@@ -200,9 +207,11 @@ class Attention(nn.Module):
             if v.dim() == 4:
                 v = v.flatten(0, 1)
 
+        # Update Cache
         if k_cache.numel() and v_cache.numel():
             store_kvcache(k, v, k_cache, v_cache, context.slot_mapping)
 
+        # Compute
         if context.is_prefill:
             o = varlen_attention_prefill(
                 q,
@@ -215,12 +224,15 @@ class Attention(nn.Module):
                 self.scale,
             )
         else:
+            # Decode: Zero-Copy CUDA Kernel
             q_input = q.squeeze(1) if q.dim() == 4 else q
 
+            # Ensure float32 for this specific kernel implementation
             original_dtype = q_input.dtype
             if q_input.dtype != torch.float32:
                 q_input = q_input.float()
 
+            # Use .int() for index tensors to match C++ 'int*' signature
             o = paged_attn_cuda.paged_attention_cuda(
                 q_input,
                 k_cache.float(),
@@ -255,6 +267,7 @@ def varlen_attention_prefill(q, k, v, cu_q, cu_k, max_q, max_k, scale):
         k_i = k[cu_k[i] : cu_k[i + 1]].unsqueeze(0).transpose(1, 2)
         v_i = v[cu_k[i] : cu_k[i + 1]].unsqueeze(0).transpose(1, 2)
 
+        # GQA Handle
         if q_i.shape[1] != k_i.shape[1]:
             rep = q_i.shape[1] // k_i.shape[1]
             k_i = k_i.repeat_interleave(rep, dim=1)
